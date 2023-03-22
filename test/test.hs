@@ -117,6 +117,17 @@ tests = testGroup "hevm"
         -- there won't be query now as accessStorage uses fetch cache
         assertBool (show vm4._result) (isNothing vm4._result)
     ]
+  , testGroup "SimplifierUnitTests"
+    -- common overflow cases that the simplifier was getting wrong
+    [ testCase "writeWord-overflow" $ do
+        let e = ReadByte (Lit 0x0) (WriteWord (Lit 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd) (Lit 0x0) (ConcreteBuf "\255\255\255\255"))
+        b <- checkEquiv e (Expr.simplify e)
+        assertBool "Simplifier failed" b
+    , testCase "CopySlice-overflow" $ do
+        let e = ReadWord (Lit 0x0) (CopySlice (Lit 0x0) (Lit 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc) (Lit 0x6) (ConcreteBuf "\255\255\255\255\255\255") (ConcreteBuf ""))
+        b <- checkEquiv e (Expr.simplify e)
+        assertBool "Simplifier failed" b
+    ]
   -- These tests fuzz the simplifier by generating a random expression,
   -- applying some simplification rules, and then using the smt encoding to
   -- check that the simplified version is semantically equivalent to the
@@ -544,6 +555,18 @@ tests = testGroup "hevm"
         assertEqual "Division by 0 needs b=0" (getVar ctr "arg2") 0
         putStrLn "expected counterexample found"
      ,
+      testCase "unused-args-fail" $ do
+         Just c <- solcRuntime "C"
+             [i|
+             contract C {
+               function fun(uint256 a) public pure {
+                 assert(false);
+               }
+             }
+             |]
+         (_, [Cex _]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s [0x1] c Nothing [] debugVeriOpts
+         putStrLn "expected counterexample found"
+      ,
      testCase "enum-conversion-fail" $ do
         Just c <- solcRuntime "MyContract"
             [i|
@@ -899,6 +922,19 @@ tests = testGroup "hevm"
             |]
         (_, [Qed _])  <- withSolvers Z3 1 Nothing $ \s -> checkAssert s defaultPanicCodes c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] defaultVeriOpts
         putStrLn "sdiv works as expected"
+      ,
+     testCase "signed-overflow-checks" $ do
+        Just c <- solcRuntime "C"
+            [i|
+            contract C {
+              function fun(uint160 a) external {
+                  int256 j = int256(uint256(a)) + 1;
+                  assert(false);
+              }
+            }
+            |]
+        (_, [Cex _])  <- withSolvers Z3 1 Nothing $ \s -> checkAssert s defaultPanicCodes c (Just (Sig "fun(uint160)" [AbiUIntType 160])) [] defaultVeriOpts
+        putStrLn "expected cex discovered"
       ,
      testCase "opcode-signextend-neg" $ do
         Just c <- solcRuntime "MyContract"
