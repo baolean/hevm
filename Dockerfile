@@ -12,8 +12,10 @@ RUN apt-get update
 # Install smt-solvers: (1) cvc5
 RUN mkdir cvc5-solver \
   && cd cvc5-solver \
-  && wget https://github.com/cvc5/cvc5/releases/download/cvc5-1.0.5/cvc5-Linux \
-  && mv cvc5-Linux cvc5 
+  && wget https://github.com/cvc5/cvc5/releases/download/cvc5-1.0.4/cvc5-Linux \
+  && mv cvc5-Linux cvc5 \
+  && chmod +x cvc5
+
 
 ENV PATH=/cvc5-solver:$PATH
 
@@ -27,7 +29,7 @@ ENV PATH=/z3/bin:$PATH
 
 # Download hevm binary
 RUN mkdir hevm && cd hevm \
-  && wget https://github.com/ethereum/hevm/releases/download/release%2F0.50.3/hevm-x86_64-linux \
+  && wget https://github.com/ethereum/hevm/releases/download/release%2F0.50.4/hevm-x86_64-linux \
   && mv hevm-x86_64-linux hevm \
   && chmod +x hevm
 
