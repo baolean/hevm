@@ -37,7 +37,7 @@ ENV PATH=/hevm:$PATH
 
 # Install solc through solc-select
 RUN pip install solc-select \
-  && solc-select install 0.8.13 \
-  && solc-select use 0.8.13
+  && solc-select install 0.8.17 \
+  && solc-select use 0.8.17
 
 ENTRYPOINT ["/bin/bash"]
