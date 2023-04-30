@@ -23,13 +23,13 @@ ENV PATH=/cvc5-solver:$PATH
 RUN wget https://github.com/Z3Prover/z3/releases/download/z3-4.12.1/z3-4.12.1-x64-glibc-2.35.zip \
   && unzip z3-4.12.1-x64-glibc-2.35.zip \
   && rm z3-4.12.1-x64-glibc-2.35.zip \
-  && mv z3-4.12.1-x64-glibc-2.35 z3 
+  && mv z3-4.12.1-x64-glibc-2.35 z3
 
 ENV PATH=/z3/bin:$PATH
 
 # Download hevm binary
 RUN mkdir hevm && cd hevm \
-  && wget https://github.com/ethereum/hevm/releases/download/release%2F0.50.4/hevm-x86_64-linux \
+  && wget https://github.com/ethereum/hevm/releases/download/release%2F0.51.0/hevm-x86_64-linux \
   && mv hevm-x86_64-linux hevm \
   && chmod +x hevm
 
@@ -39,5 +39,9 @@ ENV PATH=/hevm:$PATH
 RUN pip install solc-select \
   && solc-select install 0.8.17 \
   && solc-select use 0.8.17
+
+# Install Foundry
+RUN curl -L https://foundry.paradigm.xyz | bash
+RUN /root/.foundry/bin/foundryup
 
 ENTRYPOINT ["/bin/bash"]
