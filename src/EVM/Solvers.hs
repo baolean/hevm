@@ -18,8 +18,8 @@ import Control.Concurrent.Chan (Chan, newChan, writeChan, readChan)
 import Control.Concurrent (forkIO, killThread)
 import Control.Monad.State.Strict
 import Data.Char (isSpace)
-
 import Data.Maybe (fromMaybe)
+
 import Data.Text.Lazy (Text)
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -30,7 +30,7 @@ import Data.Text.Lazy.Builder
 import System.Process (createProcess, cleanupProcess, proc, ProcessHandle, std_in, std_out, std_err, StdStream(..))
 
 import EVM.SMT
-import EVM.Types
+import EVM.Types hiding (Unknown)
 
 -- | Supported solvers
 data Solver
@@ -48,11 +48,11 @@ instance Show Solver where
 
 -- | A running solver instance
 data SolverInstance = SolverInstance
-  { _type :: Solver
-  , _stdin :: Handle
-  , _stdout :: Handle
-  , _stderr :: Handle
-  , _process :: ProcessHandle
+  { solvertype :: Solver
+  , stdin      :: Handle
+  , stdout     :: Handle
+  , stderr     :: Handle
+  , process    :: ProcessHandle
   }
 
 -- | A channel representing a group of solvers
@@ -145,7 +145,7 @@ getModel inst cexvars = do
   -- get an initial version of the model from the solver
   initialModel <- getRaw
   -- get concrete values for each buffers max read index
-  hints <- capHints <$> queryMaxReads (getValue inst) cexvars.buffersV
+  hints <- capHints <$> queryMaxReads (getValue inst) cexvars.buffers
   -- check the sizes of buffer models and shrink if needed
   if bufsUsable initialModel
   then do
@@ -154,11 +154,11 @@ getModel inst cexvars = do
   where
     getRaw :: IO SMTCex
     getRaw = do
-      vars <- getVars parseVar (getValue inst) (fmap T.toStrict cexvars.calldataV)
-      buffers <- getBufs (getValue inst) (Map.keys cexvars.buffersV)
+      vars <- getVars parseVar (getValue inst) (fmap T.toStrict cexvars.calldata)
+      buffers <- getBufs (getValue inst) (Map.keys cexvars.buffers)
       storage <- getStore (getValue inst) cexvars.storeReads
-      blockctx <- getVars parseBlockCtx (getValue inst) (fmap T.toStrict cexvars.blockContextV)
-      txctx <- getVars parseFrameCtx (getValue inst) (fmap T.toStrict cexvars.txContextV)
+      blockctx <- getVars parseBlockCtx (getValue inst) (fmap T.toStrict cexvars.blockContext)
+      txctx <- getVars parseFrameCtx (getValue inst) (fmap T.toStrict cexvars.txContext)
       pure $ SMTCex vars buffers storage blockctx txctx
 
     -- sometimes the solver might give us back a model for the max read index
@@ -218,9 +218,13 @@ getModel inst cexvars = do
           -- TODO: do I need to check the write idx here?
           (Write _ idx next) -> idx <= 1024 && go (Comp next)
 
+mkTimeout :: Maybe Natural -> Text
+mkTimeout t = T.pack $ show $ (1000 *)$ case t of
+  Nothing -> 300 :: Natural
+  Just t' -> t'
 
 -- | Arguments used when spawing a solver instance
-solverArgs :: Solver -> Maybe (Natural) -> [Text]
+solverArgs :: Solver -> Maybe Natural -> [Text]
 solverArgs solver timeout = case solver of
   Bitwuzla -> error "TODO: Bitwuzla args"
   Z3 ->
@@ -229,7 +233,7 @@ solverArgs solver timeout = case solver of
     [ "--lang=smt"
     , "--no-interactive"
     , "--produce-models"
-    , "--tlimit-per=" <> T.pack (show (1000 * fromMaybe 10 timeout))
+    , "--tlimit-per=" <> mkTimeout timeout
     ]
   Custom _ -> []
 
@@ -240,13 +244,11 @@ spawnSolver solver timeout = do
   (Just stdin, Just stdout, Just stderr, process) <- createProcess cmd
   hSetBuffering stdin (BlockBuffering (Just 1000000))
   let solverInstance = SolverInstance solver stdin stdout stderr process
-  case timeout of
-    Nothing -> pure solverInstance
-    Just t -> case solver of
-        CVC5 -> pure solverInstance
-        _ -> do
-          _ <- sendLine' solverInstance $ "(set-option :timeout " <> T.pack (show t) <> ")"
-          pure solverInstance
+  case solver of
+    CVC5 -> pure solverInstance
+    _ -> do
+      _ <- sendLine' solverInstance $ "(set-option :timeout " <> mkTimeout timeout <> ")"
+      pure solverInstance
 
 -- | Cleanly shutdown a running solver instnace
 stopSolver :: SolverInstance -> IO ()

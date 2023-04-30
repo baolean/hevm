@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0] - 2023-04-27
+
+## Added
+
+- `hevm` can now execute unit tests in foundry projects. Just run `hevm test` from the root of a foundry repo, and all unit tests will be executed (including prove tests).
+- A new stack based loop detection heuristic
+- Analysis of partial execution traces is now supported
+
+## Changed
+
+- `hevm dapp-test` has been replaced with `hevm test --project-type DappTools`.
+- `hevm test` no longer supports parsing solidity output in the combined json format.
+- The default value for `--ask-smt-iterations` has been changed to 1
+- The SMT solver is never queried for branch conditions that do not occur in a loop (as determined by the loop detection heuristic)
+
+## Fixed
+
+- `--max-iterations` is respected in cases where path conditions have become inconsistent
+- `--max-iterations` is now respected for loops with a concrete branch condition
+
+## Fixed
+
+- Fixed a bug where underflow was possible when transfering eth
+
+## [0.50.5] - 2023-04-18
+
+## Changed
+
+- The `--storage-model` parameter has been replaced with `--initial-storage`
+- The `--smttimeout` argument now expects a value in seconds not milliseconds
+- The default smt timeout has been set to 5 minutes
+- `hevm symbolic` now searches only for user defined assertions by default
+
+### Fixed
+
+- The `prank` cheatcode now transfers value from the correct address
+- Fixed an off-by-one error in `EVM.Debug.srcMapCodePos`
+
 ## [0.50.4] - 2023-03-17
 
 ### Fixed
@@ -23,8 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented a shrinking algorithm for counterexamples
 - A new differential fuzzing test harness that compares the concrete semantics, as well as parts of the symbolic semantics against the geth evm implementation
 - The `hevm` library can now be built on Windows systems.
-- Support for function pointers in ABI
 - `equivalence` can now be checked for fully or partially concrete calldata
+- Support for function pointers in ABI
 
 ## [0.50.3] - 2023-02-17
 

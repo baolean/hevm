@@ -25,17 +25,19 @@ import Data.Typeable
 import Data.List qualified (elemIndex)
 import Data.DoubleWord
 import Test.Tasty
-import Test.Tasty.QuickCheck hiding (Failure)
+import Test.Tasty.QuickCheck hiding (Failure, Success)
 import Test.QuickCheck.Instances.Text()
 import Test.QuickCheck.Instances.Natural()
 import Test.QuickCheck.Instances.ByteString()
 import Test.Tasty.HUnit
-import Test.Tasty.Runners hiding (Failure)
+import Test.Tasty.Runners hiding (Failure, Success)
 import Test.Tasty.ExpectedFailure
-import EVM.Tracing qualified
+import EVM.Test.Tracing qualified as Tracing
 
 import Control.Monad.State.Strict hiding (state)
-import Control.Lens hiding (List, pre, (.>), re, op)
+import Optics.Core hiding (pre, re)
+import Optics.State
+import Optics.Operators.Unsafe
 
 import qualified Data.Vector as Vector
 import Data.String.Here
@@ -44,7 +46,7 @@ import qualified Data.Map.Strict as Map
 import Data.Binary.Put (runPut)
 import Data.Binary.Get (runGetOrFail)
 
-import EVM hiding (allowFFI)
+import EVM hiding (choose)
 import EVM.SymExec
 import EVM.ABI
 import EVM.Exec
@@ -53,14 +55,17 @@ import EVM.Precompiled
 import EVM.RLP
 import EVM.Solidity
 import EVM.Types
+import EVM.Format (hexText)
 import EVM.Traversals
 import EVM.Concrete (createAddress)
 import EVM.SMT hiding (one)
 import EVM.Solvers
 import qualified EVM.Expr as Expr
+import qualified EVM.Stepper as Stepper
+import qualified EVM.Fetch as Fetch
 import qualified Data.Text as T
 import Data.List (isSubsequenceOf)
-import EVM.TestUtils
+import EVM.Test.Utils
 import GHC.Conc (getNumProcessors)
 
 main :: IO ()
@@ -73,8 +78,7 @@ runSubSet p = defaultMain . applyPattern p $ tests
 
 tests :: TestTree
 tests = testGroup "hevm"
-  [
-  EVM.Tracing.tests
+  [ Tracing.tests
   , testGroup "StorageTests"
     [ testCase "read-from-sstore" $ assertEqual ""
         (Lit 0xab)
@@ -97,25 +101,25 @@ tests = testGroup "hevm"
     , testCase "accessStorage uses fetchedStorage" $ do
         let dummyContract =
               (initialContract (RuntimeCode (ConcreteRuntimeCode mempty)))
-                { _external = True }
+                { external = True }
             vm = vmForEthrunCreation ""
             -- perform the initial access
             vm1 = execState (EVM.accessStorage 0 (Lit 0) (pure . pure ())) vm
             -- it should fetch the contract first
-            vm2 = case vm1._result of
-                    Just (VMFailure (Query (PleaseFetchContract _addr continue))) ->
+            vm2 = case vm1.result of
+                    Just (HandleEffect (Query (PleaseFetchContract _addr continue))) ->
                       execState (continue dummyContract) vm1
                     _ -> error "unexpected result"
             -- then it should fetch the slow
-            vm3 = case vm2._result of
-                    Just (VMFailure (Query (PleaseFetchSlot _addr _slot continue))) ->
+            vm3 = case vm2.result of
+                    Just (HandleEffect (Query (PleaseFetchSlot _addr _slot continue))) ->
                       execState (continue 1337) vm2
                     _ -> error "unexpected result"
             -- perform the same access as for vm1
             vm4 = execState (EVM.accessStorage 0 (Lit 0) (pure . pure ())) vm3
 
         -- there won't be query now as accessStorage uses fetch cache
-        assertBool (show vm4._result) (isNothing vm4._result)
+        assertBool (show vm4.result) (isNothing vm4.result)
     ]
   , testGroup "SimplifierUnitTests"
     -- common overflow cases that the simplifier was getting wrong
@@ -352,7 +356,7 @@ tests = testGroup "hevm"
           Right ("", _, x') -> x' == x
           _ -> False
     ]
-  , testGroup "Solidity expressions"
+  , testGroup "Solidity-Expressions"
     [ testCase "Trivial" $
         SolidityCall "x = 3;" []
           ===> AbiUInt 256 3
@@ -476,8 +480,7 @@ tests = testGroup "hevm"
                 |]
 
         (json, path') <- solidity' srccode
-        let (solc', _, _) = fromJust $ readJSON json
-            initCode :: ByteString
+        let (Contracts solc', _, _) = fromJust $ readStdJSON json
             initCode = (solc' ^?! ix (path' <> ":A")).creationCode
         -- add constructor arguments
         assertEqual "constructor args screwed up metadata stripping" (stripBytecodeMetadata (initCode <> encodeAbiValue (AbiUInt 256 1))) (stripBytecodeMetadata initCode)
@@ -564,7 +567,7 @@ tests = testGroup "hevm"
                }
              }
              |]
-         (_, [Cex _]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s [0x1] c Nothing [] debugVeriOpts
+         (_, [Cex _]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s [0x1] c Nothing [] defaultVeriOpts
          putStrLn "expected counterexample found"
       ,
      testCase "enum-conversion-fail" $ do
@@ -619,8 +622,8 @@ tests = testGroup "hevm"
         -- assertBool "Access must be beyond element 2" $ (getVar ctr "arg1") > 1
         putStrLn "expected counterexample found"
       ,
-      -- TODO the system currently does not allow for symbolic array size allocation
-      expectFail $ testCase "alloc-too-much" $ do
+      -- Note: we catch the assertion here, even though we are only able to explore partially
+      testCase "alloc-too-much" $ do
         Just c <- solcRuntime "MyContract"
             [i|
             contract MyContract {
@@ -629,7 +632,8 @@ tests = testGroup "hevm"
               }
              }
             |]
-        (_, [Cex _]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s [0x41] c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] defaultVeriOpts
+        (_, [Cex _]) <- withSolvers Z3 1 Nothing $ \s ->
+          checkAssert s [0x41] c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] defaultVeriOpts
         putStrLn "expected counterexample found"
       ,
       -- TODO the system currently does not allow for symbolic JUMP
@@ -653,49 +657,152 @@ tests = testGroup "hevm"
         putStrLn "expected counterexample found"
  ]
 
-  , testGroup "Dapp Tests"
+  , testGroup "Dapp-Tests"
     [ testCase "Trivial-Pass" $ do
         let testFile = "test/contracts/pass/trivial.sol"
-        runDappTest testFile ".*" >>= assertEqual "test result" True
+        runSolidityTest testFile ".*" >>= assertEqual "test result" True
+    , testCase "DappTools" $ do
+        -- quick smokecheck to make sure that we can parse dapptools style build outputs
+        let cases =
+              [ ("test/contracts/pass/trivial.sol", ".*", True)
+              , ("test/contracts/pass/invariants.sol", "invariantTestThisBal", True)
+              , ("test/contracts/pass/dsProvePass.sol", "proveEasy", True)
+              , ("test/contracts/fail/trivial.sol", ".*", False)
+              , ("test/contracts/fail/invariantFail.sol", "invariantCount", False)
+              , ("test/contracts/fail/dsProveFail.sol", "prove_add", False)
+              ]
+        results <- forM cases $ \(testFile, match, expected) -> do
+          actual <- runSolidityTestCustom testFile match Nothing False Nothing DappTools
+          pure (actual == expected)
+        assertBool "test result" (and results)
     , testCase "Trivial-Fail" $ do
         let testFile = "test/contracts/fail/trivial.sol"
-        runDappTest testFile "testFalse" >>= assertEqual "test result" False
+        runSolidityTest testFile "testFalse" >>= assertEqual "test result" False
     , testCase "Abstract" $ do
         let testFile = "test/contracts/pass/abstract.sol"
-        runDappTest testFile ".*" >>= assertEqual "test result" True
+        runSolidityTest testFile ".*" >>= assertEqual "test result" True
     , testCase "Constantinople" $ do
         let testFile = "test/contracts/pass/constantinople.sol"
-        runDappTest testFile ".*" >>= assertEqual "test result" True
+        runSolidityTest testFile ".*" >>= assertEqual "test result" True
     , testCase "Prove-Tests-Pass" $ do
         let testFile = "test/contracts/pass/dsProvePass.sol"
-        runDappTest testFile ".*" >>= assertEqual "test result" True
+        runSolidityTest testFile ".*" >>= assertEqual "test result" True
     , testCase "Prove-Tests-Fail" $ do
         let testFile = "test/contracts/fail/dsProveFail.sol"
-        runDappTest testFile "prove_trivial" >>= assertEqual "test result" False
-        runDappTest testFile "prove_add" >>= assertEqual "test result" False
-        --runDappTest testFile "prove_smtTimeout" >>= assertEqual "test result" False
-        runDappTest testFile "prove_multi" >>= assertEqual "test result" False
-        runDappTest testFile "prove_mul" >>= assertEqual "test result" False
+        runSolidityTest testFile "prove_trivial" >>= assertEqual "test result" False
+        runSolidityTest testFile "prove_add" >>= assertEqual "test result" False
+        --runSolidityTest testFile "prove_smtTimeout" >>= assertEqual "test result" False
+        runSolidityTest testFile "prove_multi" >>= assertEqual "test result" False
+        runSolidityTest testFile "prove_mul" >>= assertEqual "test result" False
         -- TODO: implement overflow checking optimizations and enable, currently this runs forever
-        --runDappTest testFile "prove_distributivity" >>= assertEqual "test result" False
-        runDappTest testFile "prove_transfer" >>= assertEqual "test result" False
+        --runSolidityTest testFile "prove_distributivity" >>= assertEqual "test result" False
+        runSolidityTest testFile "prove_transfer" >>= assertEqual "test result" False
     , testCase "Loop-Tests" $ do
         let testFile = "test/contracts/pass/loops.sol"
-        runDappTestCustom testFile "prove_loop" (Just 10) False Nothing >>= assertEqual "test result" True
-        runDappTestCustom testFile "prove_loop" (Just 100) False Nothing >>= assertEqual "test result" False
+        runSolidityTestCustom testFile "prove_loop" (Just 10) False Nothing Foundry >>= assertEqual "test result" True
+        runSolidityTestCustom testFile "prove_loop" (Just 100) False Nothing Foundry >>= assertEqual "test result" False
     , testCase "Invariant-Tests-Pass" $ do
         let testFile = "test/contracts/pass/invariants.sol"
-        runDappTest testFile ".*" >>= assertEqual "test result" True
+        runSolidityTest testFile ".*" >>= assertEqual "test result" True
     , testCase "Invariant-Tests-Fail" $ do
         let testFile = "test/contracts/fail/invariantFail.sol"
-        runDappTest testFile "invariantFirst" >>= assertEqual "test result" False
-        runDappTest testFile "invariantCount" >>= assertEqual "test result" False
+        runSolidityTest testFile "invariantFirst" >>= assertEqual "test result" False
+        runSolidityTest testFile "invariantCount" >>= assertEqual "test result" False
     , testCase "Cheat-Codes-Pass" $ do
         let testFile = "test/contracts/pass/cheatCodes.sol"
-        runDappTest testFile ".*" >>= assertEqual "test result" True
+        runSolidityTest testFile ".*" >>= assertEqual "test result" True
     , testCase "Cheat-Codes-Fail" $ do
         let testFile = "test/contracts/fail/cheatCodes.sol"
-        runDappTestCustom testFile "testBadFFI" Nothing False Nothing >>= assertEqual "test result" False
+        runSolidityTestCustom testFile "testBadFFI" Nothing False Nothing Foundry >>= assertEqual "test result" False
+        runSolidityTestCustom testFile "test_prank_underflow" Nothing False Nothing Foundry >>= assertEqual "test result" False
+    ]
+  , testGroup "max-iterations"
+    [ testCase "concrete-loops-reached" $ do
+        Just c <- solcRuntime "C"
+            [i|
+            contract C {
+              function fun() external payable returns (uint) {
+                uint count = 0;
+                for (uint i = 0; i < 5; i++) count++;
+                return count;
+              }
+            }
+            |]
+        let sig = Just $ Sig "fun()" []
+            opts = defaultVeriOpts{ maxIter = Just 3 }
+        (e, [Qed _]) <- withSolvers Z3 1 Nothing $
+          \s -> checkAssert s defaultPanicCodes c sig [] opts
+        assertBool "The expression is not partial" $ isPartial e
+    , testCase "concrete-loops-not-reached" $ do
+        Just c <- solcRuntime "C"
+            [i|
+            contract C {
+              function fun() external payable returns (uint) {
+                uint count = 0;
+                for (uint i = 0; i < 5; i++) count++;
+                return count;
+              }
+            }
+            |]
+
+        let sig = Just $ Sig "fun()" []
+            opts = defaultVeriOpts{ maxIter = Just 6 }
+        (e, [Qed _]) <- withSolvers Z3 1 Nothing $
+          \s -> checkAssert s defaultPanicCodes c sig [] opts
+        assertBool "The expression is partial" $ not $ isPartial e
+    , testCase "symbolic-loops-reached" $ do
+        Just c <- solcRuntime "C"
+            [i|
+            contract C {
+              function fun(uint j) external payable returns (uint) {
+                uint count = 0;
+                for (uint i = 0; i < j; i++) count++;
+                return count;
+              }
+            }
+            |]
+        (e, [Qed _]) <- withSolvers Z3 1 Nothing $
+          \s -> checkAssert s defaultPanicCodes c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] (defaultVeriOpts{ maxIter = Just 5 })
+        assertBool "The expression is not partial" $ Expr.containsNode isPartial e
+    , testCase "inconsistent-paths" $ do
+        Just c <- solcRuntime "C"
+            [i|
+            contract C {
+              function fun(uint j) external payable returns (uint) {
+                require(j <= 3);
+                uint count = 0;
+                for (uint i = 0; i < j; i++) count++;
+                return count;
+              }
+            }
+            |]
+        let sig = Just $ Sig "fun(uint256)" [AbiUIntType 256]
+            -- we dont' ask the solver about the loop condition until we're
+            -- already in an inconsistent path (i == 5, j <= 3, i < j), so we
+            -- will continue looping here until we hit max iterations
+            opts = defaultVeriOpts{ maxIter = Just 10, askSmtIters = 5 }
+        (e, [Qed _]) <- withSolvers Z3 1 Nothing $
+          \s -> checkAssert s defaultPanicCodes c sig [] opts
+        assertBool "The expression is not partial" $ Expr.containsNode isPartial e
+    , testCase "symbolic-loops-not-reached" $ do
+        Just c <- solcRuntime "C"
+            [i|
+            contract C {
+              function fun(uint j) external payable returns (uint) {
+                require(j <= 3);
+                uint count = 0;
+                for (uint i = 0; i < j; i++) count++;
+                return count;
+              }
+            }
+            |]
+        let sig = Just $ Sig "fun(uint256)" [AbiUIntType 256]
+            -- askSmtIters is low enough here to avoid the inconsistent path
+            -- conditions, so we never hit maxIters
+            opts = defaultVeriOpts{ maxIter = Just 5, askSmtIters = 1 }
+        (e, [Qed _]) <- withSolvers Z3 1 Nothing $
+          \s -> checkAssert s defaultPanicCodes c sig [] opts
+        assertBool "The expression is partial" $ not (Expr.containsNode isPartial e)
     ]
   , testGroup "Symbolic execution"
       [
@@ -773,17 +880,9 @@ tests = testGroup "hevm"
           }
         }
         |]
-      let
-        opts = VeriOpts
-          { simp = False
-          , debug = False
-          , maxIter = Nothing
-          , askSmtIters = Nothing
-          , rpcInfo = Nothing
-          }
-        calldata' = Just (Sig "checkval(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])
+      let sig = Just (Sig "checkval(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])
       (res, [Qed _]) <- withSolvers Z3 1 Nothing $ \s ->
-        checkAssert s defaultPanicCodes c calldata' [] opts
+        checkAssert s defaultPanicCodes c sig [] defaultVeriOpts
       putStrLn $ "successfully explored: " <> show (Expr.numBranches res) <> " paths"
      ,
      -- TODO look at tests here for SAR: https://github.com/dapphub/dapptools/blob/01ef8ea418c3fe49089a44d56013d8fcc34a1ec2/src/dapp-tests/pass/constantinople.sol#L250
@@ -1142,15 +1241,15 @@ tests = testGroup "hevm"
                                        _ -> error "expected 2 args"
                         in (x .<= Expr.add x y)
                         -- TODO check if it's needed
-                           .&& view (state . callvalue) preVM .== Lit 0
+                           .&& preVM.state.callvalue .== Lit 0
             post prestate leaf =
               let (x, y) = case getStaticAbiArgs 2 prestate of
                              [x', y'] -> (x', y')
                              _ -> error "expected 2 args"
               in case leaf of
-                   EVM.Types.Return _ b _ -> (ReadWord (Lit 0) b) .== (Add x y)
+                   Success _ b _ -> (ReadWord (Lit 0) b) .== (Add x y)
                    _ -> PBool True
-        (res, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s safeAdd (Just (Sig "add(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts SymbolicS (Just pre) (Just post)
+        (res, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s safeAdd (Just (Sig "add(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts AbstractStore (Just pre) (Just post)
         putStrLn $ "successfully explored: " <> show (Expr.numBranches res) <> " paths"
      ,
 
@@ -1168,16 +1267,16 @@ tests = testGroup "hevm"
                                        _ -> error "expected 2 args"
                         in (x .<= Expr.add x y)
                            .&& (x .== y)
-                           .&& Control.Lens.view (state . callvalue) preVM .== Lit 0
+                           .&& preVM.state.callvalue .== Lit 0
             post prestate leaf =
               let (_, y) = case getStaticAbiArgs 2 prestate of
                              [x', y'] -> (x', y')
                              _ -> error "expected 2 args"
               in case leaf of
-                   EVM.Types.Return _ b _ -> (ReadWord (Lit 0) b) .== (Mul (Lit 2) y)
+                   Success _ b _ -> (ReadWord (Lit 0) b) .== (Mul (Lit 2) y)
                    _ -> PBool True
         (res, [Qed _]) <- withSolvers Z3 1 Nothing $ \s ->
-          verifyContract s safeAdd (Just (Sig "add(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts SymbolicS (Just pre) (Just post)
+          verifyContract s safeAdd (Just (Sig "add(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts AbstractStore (Just pre) (Just post)
         putStrLn $ "successfully explored: " <> show (Expr.numBranches res) <> " paths"
       ,
       testCase "summary storage writes" $ do
@@ -1193,17 +1292,17 @@ tests = testGroup "hevm"
             }
           }
           |]
-        let pre vm = Lit 0 .== Control.Lens.view (state . callvalue) vm
+        let pre vm = Lit 0 .== vm.state.callvalue
             post prestate leaf =
               let y = case getStaticAbiArgs 1 prestate of
                         [y'] -> y'
                         _ -> error "expected 1 arg"
-                  this = Expr.litAddr $ Control.Lens.view (state . codeContract) prestate
-                  prex = Expr.readStorage' this (Lit 0) (Control.Lens.view (EVM.env . EVM.storage) prestate)
+                  this = Expr.litAddr $ prestate.state.codeContract
+                  prex = Expr.readStorage' this (Lit 0) prestate.env.storage
               in case leaf of
-                EVM.Types.Return _ _ postStore -> Expr.add prex (Expr.mul (Lit 2) y) .== (Expr.readStorage' this (Lit 0) postStore)
+                Success _ _ postStore -> Expr.add prex (Expr.mul (Lit 2) y) .== (Expr.readStorage' this (Lit 0) postStore)
                 _ -> PBool True
-        (res, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "f(uint256)" [AbiUIntType 256])) [] defaultVeriOpts SymbolicS (Just pre) (Just post)
+        (res, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "f(uint256)" [AbiUIntType 256])) [] defaultVeriOpts AbstractStore (Just pre) (Just post)
         putStrLn $ "successfully explored: " <> show (Expr.numBranches res) <> " paths"
         ,
         -- tests how whiffValue handles Neg via application of the triple IsZero simplification rule
@@ -1247,22 +1346,22 @@ tests = testGroup "hevm"
               }
             }
             |]
-          let pre vm = (Lit 0) .== Control.Lens.view (state . callvalue) vm
+          let pre vm = (Lit 0) .== vm.state.callvalue
               post prestate poststate =
                 let (x,y) = case getStaticAbiArgs 2 prestate of
                         [x',y'] -> (x',y')
                         _ -> error "expected 2 args"
-                    this = Expr.litAddr $ Control.Lens.view (state . codeContract) prestate
-                    prestore =  Control.Lens.view (EVM.env . EVM.storage) prestate
+                    this = Expr.litAddr $ prestate.state.codeContract
+                    prestore = prestate.env.storage
                     prex = Expr.readStorage' this x prestore
                     prey = Expr.readStorage' this y prestore
                 in case poststate of
-                     EVM.Types.Return _ _ poststore -> let
+                     Success _ _ poststore -> let
                            postx = Expr.readStorage' this x poststore
                            posty = Expr.readStorage' this y poststore
                        in Expr.add prex prey .== Expr.add postx posty
                      _ -> PBool True
-          (_, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "f(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts SymbolicS (Just pre) (Just post)
+          (_, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "f(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts AbstractStore (Just pre) (Just post)
           putStrLn "Correct, this can never fail"
         ,
         -- Inspired by these `msg.sender == to` token bugs
@@ -1281,22 +1380,22 @@ tests = testGroup "hevm"
               }
             }
             |]
-          let pre vm = (Lit 0) .== Control.Lens.view (state . callvalue) vm
+          let pre vm = (Lit 0) .== vm.state.callvalue
               post prestate poststate =
                 let (x,y) = case getStaticAbiArgs 2 prestate of
                         [x',y'] -> (x',y')
                         _ -> error "expected 2 args"
-                    this = Expr.litAddr $ Control.Lens.view (state . codeContract) prestate
-                    prestore =  Control.Lens.view (EVM.env . EVM.storage) prestate
+                    this = Expr.litAddr $ prestate.state.codeContract
+                    prestore =  prestate.env.storage
                     prex = Expr.readStorage' this x prestore
                     prey = Expr.readStorage' this y prestore
                 in case poststate of
-                     EVM.Types.Return _ _ poststore -> let
+                     Success _ _ poststore -> let
                            postx = Expr.readStorage' this x poststore
                            posty = Expr.readStorage' this y poststore
                        in Expr.add prex prey .== Expr.add postx posty
                      _ -> PBool True
-          (_, [Cex (_, ctr)]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "f(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts SymbolicS (Just pre) (Just post)
+          (_, [Cex (_, ctr)]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "f(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts AbstractStore (Just pre) (Just post)
           let x = getVar ctr "arg1"
           let y = getVar ctr "arg2"
           putStrLn $ "y:" <> show y
@@ -1304,7 +1403,7 @@ tests = testGroup "hevm"
           assertEqual "Catch storage collisions" x y
           putStrLn "expected counterexample found"
         ,
-        testCase "Simple Assert" $ do
+        testCase "simple-assert" $ do
           Just c <- solcRuntime "C"
             [i|
             contract C {
@@ -1313,8 +1412,8 @@ tests = testGroup "hevm"
               }
              }
             |]
-          (_, [Cex (l, _)]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s defaultPanicCodes c (Just (Sig "foo()" [])) [] defaultVeriOpts
-          assertEqual "incorrect revert msg" l (EVM.Types.Revert [] (ConcreteBuf $ panicMsg 0x01))
+          (_, [Cex (Failure _ (Revert msg), _)]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s defaultPanicCodes c (Just (Sig "foo()" [])) [] defaultVeriOpts
+          assertEqual "incorrect revert msg" msg (ConcreteBuf $ panicMsg 0x01)
         ,
         testCase "simple-assert-2" $ do
           Just c <- solcRuntime "C"
@@ -1761,10 +1860,10 @@ tests = testGroup "hevm"
           Just c <- solcRuntime "C" code'
           Just a <- solcRuntime "A" code'
           (_, [Cex (_, cex)]) <- withSolvers Z3 1 Nothing $ \s -> do
-            let vm0 = abstractVM (mkCalldata (Just (Sig "call_A()" [])) []) c Nothing SymbolicS
+            let vm0 = abstractVM (mkCalldata (Just (Sig "call_A()" [])) []) c Nothing AbstractStore
             let vm = vm0
-                  & set (state . callvalue) (Lit 0)
-                  & over (EVM.env . contracts)
+                  & set (#state % #callvalue) (Lit 0)
+                  & over (#env % #contracts)
                        (Map.insert aAddr (initialContract (RuntimeCode (ConcreteRuntimeCode a))))
             verify s defaultVeriOpts vm (Just $ checkAssertions defaultPanicCodes)
 
@@ -1829,7 +1928,7 @@ tests = testGroup "hevm"
         ,
         ignoreTest $ testCase "safemath distributivity (yul)" $ do
           let yulsafeDistributivity = hex "6355a79a6260003560e01c14156016576015601f565b5b60006000fd60a1565b603d602d604435600435607c565b6039602435600435607c565b605d565b6052604b604435602435605d565b600435607c565b141515605a57fe5b5b565b6000828201821115151560705760006000fd5b82820190505b92915050565b6000818384048302146000841417151560955760006000fd5b82820290505b92915050565b"
-          let vm =  abstractVM (mkCalldata (Just (Sig "distributivity(uint256,uint256,uint256)" [AbiUIntType 256, AbiUIntType 256, AbiUIntType 256])) []) yulsafeDistributivity Nothing SymbolicS
+          let vm =  abstractVM (mkCalldata (Just (Sig "distributivity(uint256,uint256,uint256)" [AbiUIntType 256, AbiUIntType 256, AbiUIntType 256])) []) yulsafeDistributivity Nothing AbstractStore
           (_, [Qed _]) <-  withSolvers Z3 1 Nothing $ \s -> verify s defaultVeriOpts vm (Just $ checkAssertions defaultPanicCodes)
           putStrLn "Proven"
         ,
@@ -1855,7 +1954,7 @@ tests = testGroup "hevm"
               }
             |]
 
-          (_, [Qed _]) <- withSolvers Z3 1 Nothing $ \s -> checkAssert s defaultPanicCodes c (Just (Sig "distributivity(uint256,uint256,uint256)" [AbiUIntType 256, AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts
+          (_, [Qed _]) <- withSolvers Z3 1 (Just 99999999) $ \s -> checkAssert s defaultPanicCodes c (Just (Sig "distributivity(uint256,uint256,uint256)" [AbiUIntType 256, AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts
           putStrLn "Proven"
         ,
         testCase "storage-cex-1" $ do
@@ -1916,7 +2015,7 @@ tests = testGroup "hevm"
               }
             }
             |]
-          (_, [Cex (_, cex)]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] defaultVeriOpts ConcreteS Nothing (Just $ checkAssertions [0x01])
+          (_, [Cex (_, cex)]) <- withSolvers Z3 1 Nothing $ \s -> verifyContract s c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] defaultVeriOpts EmptyStore Nothing (Just $ checkAssertions [0x01])
           let testCex = Map.null cex.store
           assertBool "Did not find expected storage cex" testCex
           putStrLn "Expected counterexample found"
@@ -1997,15 +2096,14 @@ tests = testGroup "hevm"
               }
           |]
         withSolvers Z3 3 Nothing $ \s -> do
-          let myVeriOpts = VeriOpts{ simp = True, debug = False, maxIter = Just 2, askSmtIters = Just 2, rpcInfo = Nothing}
-          a <- equivalenceCheck s aPrgm bPrgm myVeriOpts (mkCalldata Nothing [])
+          a <- equivalenceCheck s aPrgm bPrgm defaultVeriOpts (mkCalldata Nothing [])
           assertEqual "Must be different" (any isCex a) True
           return ()
       , testCase "eq-all-yul-optimization-tests" $ do
-        let myVeriOpts = VeriOpts{ simp = True, debug = False, maxIter = Just 5, askSmtIters = Just 20, rpcInfo = Nothing }
-            ignoredTests = [
+        let opts = defaultVeriOpts{ maxIter = Just 5, askSmtIters = 20, loopHeuristic = Naive }
+            ignoredTests =
                     -- unbounded loop --
-                    "commonSubexpressionEliminator/branches_for.yul"
+                    [ "commonSubexpressionEliminator/branches_for.yul"
                     , "conditionalSimplifier/no_opt_if_break_is_not_last.yul"
                     , "conditionalUnsimplifier/no_opt_if_break_is_not_last.yul"
                     , "expressionSimplifier/inside_for.yul"
@@ -2220,7 +2318,7 @@ tests = testGroup "hevm"
                 False -> recursiveList ax (a:b)
           recursiveList [] b = pure b
         files <- recursiveList fullpaths []
-        let filesFiltered = filter (\file -> not $ any (\filt -> Data.List.isSubsequenceOf filt file) ignoredTests) files
+        let filesFiltered = filter (\file -> not $ any (`isSubsequenceOf` file) ignoredTests) files
 
         -- Takes one file which follows the Solidity Yul optimizer unit tests format,
         -- extracts both the nonoptimized and the optimized versions, and checks equivalence.
@@ -2249,7 +2347,7 @@ tests = testGroup "hevm"
             filteredBSym = symbolicMem [ replaceAll "" $ x *=~[re|^//|] | x <- onlyAfter [re|^// step:|] unfiltered, not $ x =~ [re|^$|] ]
           start <- getCurrentTime
           putStrLn $ "Checking file: " <> f
-          when myVeriOpts.debug $ do
+          when opts.debug $ do
             putStrLn "-------------Original Below-----------------"
             mapM_ putStrLn unfiltered
             putStrLn "------------- Filtered A + Symb below-----------------"
@@ -2261,7 +2359,7 @@ tests = testGroup "hevm"
           Just bPrgm <- yul "" $ T.pack $ unlines filteredBSym
           procs <- getNumProcessors
           withSolvers CVC5 (num procs) (Just 100) $ \s -> do
-            res <- equivalenceCheck s aPrgm bPrgm myVeriOpts (mkCalldata Nothing [])
+            res <- equivalenceCheck s aPrgm bPrgm opts (mkCalldata Nothing [])
             end <- getCurrentTime
             case any isCex res of
               False -> do
@@ -2299,26 +2397,34 @@ checkEquiv l r = withSolvers Z3 1 (Just 100) $ \solvers -> do
 -- | Takes a runtime code and calls it with the provided calldata
 
 -- | Takes a creation code and some calldata, runs the creation code, and calls the resulting contract with the provided calldata
-runSimpleVM :: ByteString -> ByteString -> Maybe ByteString
-runSimpleVM x ins = case loadVM x of
-                      Nothing -> Nothing
-                      Just vm -> let calldata' = (ConcreteBuf ins)
-                       in case runState (assign (state . calldata) calldata' >> exec) vm of
-                            (VMSuccess (ConcreteBuf bs), _) -> Just bs
-                            _ -> Nothing
+runSimpleVM :: ByteString -> ByteString -> IO (Maybe ByteString)
+runSimpleVM x ins = do
+  loadVM x >>= \case
+    Nothing -> pure Nothing
+    Just vm -> do
+     let calldata = (ConcreteBuf ins)
+         vm' = set (#state % #calldata) calldata vm
+     res <- Stepper.interpret (Fetch.zero 0 Nothing) vm' Stepper.execFully
+     case res of
+       (Right (ConcreteBuf bs)) -> pure $ Just bs
+       s -> error $ show s
 
 -- | Takes a creation code and returns a vm with the result of executing the creation code
-loadVM :: ByteString -> Maybe VM
-loadVM x =
-    case runState exec (vmForEthrunCreation x) of
-       (VMSuccess (ConcreteBuf targetCode), vm1) -> do
-         let target = Control.Lens.view (state . contract) vm1
-             vm2 = execState (replaceCodeOfSelf (RuntimeCode (ConcreteRuntimeCode targetCode))) vm1
-         return $ snd $ flip runState vm2
-                (do resetState
-                    assign (state . EVM.gas) 0xffffffffffffffff -- kludge
-                    loadContract target)
-       _ -> Nothing
+loadVM :: ByteString -> IO (Maybe VM)
+loadVM x = do
+  vm1 <- Stepper.interpret (Fetch.zero 0 Nothing) (vmForEthrunCreation x) Stepper.runFully
+  case vm1.result of
+     Just (VMSuccess (ConcreteBuf targetCode)) -> do
+       let target = vm1.state.contract
+       vm2 <- Stepper.interpret (Fetch.zero 0 Nothing) vm1 (prepVm target targetCode >> Stepper.run)
+       pure $ Just vm2
+     _ -> pure Nothing
+  where
+    prepVm target targetCode = Stepper.evm $ do
+      replaceCodeOfSelf (RuntimeCode $ ConcreteRuntimeCode targetCode)
+      resetState
+      assign (#state % #gas) 0xffffffffffffffff -- kludge
+      loadContract target
 
 hex :: ByteString -> ByteString
 hex s =
@@ -2347,7 +2453,7 @@ defaultDataLocation t =
 runFunction :: Text -> ByteString -> IO (Maybe ByteString)
 runFunction c input = do
   Just x <- singleContract "X" c
-  return $ runSimpleVM x input
+  runSimpleVM x input
 
 runStatements
   :: Text -> [AbiValue] -> AbiType
@@ -2371,7 +2477,7 @@ runStatements stmts args t = do
 
 getStaticAbiArgs :: Int -> VM -> [Expr EWord]
 getStaticAbiArgs n vm =
-  let cd = Control.Lens.view (state . calldata) vm
+  let cd = vm.state.calldata
   in decodeStaticArgs 4 n cd
 
 -- includes shaving off 4 byte function sig
@@ -2466,13 +2572,13 @@ genName = fmap (T.pack . ("esc_" <> )) $ listOf1 (oneof . (fmap pure) $ ['a'..'z
 
 genEnd :: Int -> Gen (Expr End)
 genEnd 0 = oneof
- [ pure $ Failure [] EVM.Types.Invalid
- , pure $ Failure [] EVM.Types.IllegalOverflow
- , pure $ Failure [] EVM.Types.SelfDestruct
+ [ fmap (Failure [] . UnrecognizedOpcode) arbitrary
+ , pure $ Failure [] IllegalOverflow
+ , pure $ Failure [] SelfDestruction
  ]
 genEnd sz = oneof
- [ fmap (EVM.Types.Revert []) subBuf
- , liftM3 EVM.Types.Return (return []) subBuf subStore
+ [ fmap (Failure [] . Revert) subBuf
+ , liftM3 Success (return []) subBuf subStore
  , liftM3 ITE subWord subEnd subEnd
  ]
  where

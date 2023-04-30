@@ -1,11 +1,10 @@
 module EVM.Dapp where
 
-import EVM (Trace(..), ContractCode(..), Contract(..), RuntimeCode (..))
-import EVM.ABI (Event, AbiType, SolError)
 import EVM.Concrete
 import EVM.Debug (srcMapCodePos)
 import EVM.Solidity
-import EVM.Types (W256, abiKeccak, keccak', Addr, regexMatches, unlit, unlitByte)
+import EVM.Types
+import EVM.ABI
 
 import Control.Arrow ((>>>))
 import Data.Aeson (Value)
@@ -20,7 +19,6 @@ import Data.Sequence qualified as Seq
 import Data.Text (Text, isPrefixOf, pack, unpack)
 import Data.Text.Encoding (encodeUtf8)
 import Data.Vector qualified as V
-import Data.Word (Word32)
 
 data DappInfo = DappInfo
   { root       :: FilePath
@@ -29,7 +27,7 @@ data DappInfo = DappInfo
   , solcByCode :: [(Code, SolcContract)] -- for contracts with `immutable` vars.
   , sources    :: SourceCache
   , unitTests  :: [(Text, [(Test, [AbiType])])]
-  , abiMap     :: Map Word32 Method
+  , abiMap     :: Map FunctionSelector Method
   , eventMap   :: Map W256 Event
   , errorMap   :: Map W256 SolError
   , astIdMap   :: Map Int Value
@@ -53,11 +51,10 @@ data Test = ConcreteTest Text | SymbolicTest Text | InvariantTest Text
 instance Show Test where
   show t = unpack $ extractSig t
 
-dappInfo
-  :: FilePath -> Map Text SolcContract -> SourceCache -> DappInfo
-dappInfo root solcByName sources =
+dappInfo :: FilePath -> BuildOutput -> DappInfo
+dappInfo root (BuildOutput (Contracts cs) sources) =
   let
-    solcs = Map.elems solcByName
+    solcs = Map.elems cs
     astIds = astIdMap $ snd <$> Map.toList sources.asts
     immutables = filter ((/=) mempty . (.immutableReferences)) solcs
 
@@ -65,7 +62,7 @@ dappInfo root solcByName sources =
     { root = root
     , unitTests = findAllUnitTests solcs
     , sources = sources
-    , solcByName = solcByName
+    , solcByName = cs
     , solcByHash =
         let
           f g k = Map.fromList [(g x, (k, x)) | x <- solcs]
@@ -86,7 +83,7 @@ dappInfo root solcByName sources =
     }
 
 emptyDapp :: DappInfo
-emptyDapp = dappInfo "" mempty (SourceCache mempty mempty mempty)
+emptyDapp = dappInfo "" mempty
 
 -- Dapp unit tests are detected by searching within abi methods
 -- that begin with "test" or "prove", that are in a contract with
@@ -98,7 +95,7 @@ emptyDapp = dappInfo "" mempty (SourceCache mempty mempty mempty)
 -- Tests beginning with "test" are interpreted as concrete tests, whereas
 -- tests beginning with "prove" are interpreted as symbolic tests.
 
-unitTestMarkerAbi :: Word32
+unitTestMarkerAbi :: FunctionSelector
 unitTestMarkerAbi = abiKeccak (encodeUtf8 "IS_TEST()")
 
 findAllUnitTests :: [SolcContract] -> [(Text, [(Test, [AbiType])])]
@@ -141,12 +138,12 @@ extractSig (SymbolicTest sig) = sig
 extractSig (InvariantTest sig) = sig
 
 traceSrcMap :: DappInfo -> Trace -> Maybe SrcMap
-traceSrcMap dapp trace = srcMap dapp trace._traceContract trace._traceOpIx
+traceSrcMap dapp trace = srcMap dapp trace.contract trace.opIx
 
 srcMap :: DappInfo -> Contract -> Int -> Maybe SrcMap
 srcMap dapp contr opIndex = do
   sol <- findSrc contr dapp
-  case contr._contractcode of
+  case contr.contractcode of
     (InitCode _ _) ->
       Seq.lookup opIndex sol.creationSrcmap
     (RuntimeCode _) ->
@@ -154,10 +151,10 @@ srcMap dapp contr opIndex = do
 
 findSrc :: Contract -> DappInfo -> Maybe SolcContract
 findSrc c dapp = do
-  hash <- unlit c._codehash
+  hash <- maybeLitWord c.codehash
   case Map.lookup hash dapp.solcByHash of
     Just (_, v) -> Just v
-    Nothing -> lookupCode c._contractcode dapp
+    Nothing -> lookupCode c.contractcode dapp
 
 
 lookupCode :: ContractCode -> DappInfo -> Maybe SolcContract
@@ -168,7 +165,7 @@ lookupCode (RuntimeCode (ConcreteRuntimeCode c)) a =
     Just x -> return x
     Nothing -> snd <$> find (compareCode c . fst) a.solcByCode
 lookupCode (RuntimeCode (SymbolicRuntimeCode c)) a = let
-    code = BS.pack $ mapMaybe unlitByte $ V.toList c
+    code = BS.pack $ mapMaybe maybeLitByte $ V.toList c
   in case snd <$> Map.lookup (keccak' (stripBytecodeMetadata code)) a.solcByHash of
     Just x -> return x
     Nothing -> snd <$> find (compareCode code . fst) a.solcByCode
@@ -188,4 +185,4 @@ showTraceLocation dapp trace =
       case srcMapCodePos dapp.sources sm of
         Nothing -> Left "<source not found>"
         Just (fileName, lineIx) ->
-          Right (fileName <> ":" <> pack (show lineIx))
+          Right (pack fileName <> ":" <> pack (show lineIx))

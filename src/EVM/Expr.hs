@@ -15,7 +15,7 @@ import Data.Word
 import Data.Maybe
 import Data.List
 
-import Control.Lens (lens)
+import Optics.Core
 
 import EVM.Types
 import EVM.Traversals
@@ -275,7 +275,7 @@ readWordFromBytes (Lit idx) (ConcreteBuf bs) =
 readWordFromBytes i@(Lit idx) buf = let
     bytes = [readByte (Lit i') buf | i' <- [idx .. idx + 31]]
   in if Prelude.and . (fmap isLitByte) $ bytes
-     then Lit (bytesToW256 . mapMaybe unlitByte $ bytes)
+     then Lit (bytesToW256 . mapMaybe maybeLitByte $ bytes)
      else ReadWord i buf
 readWordFromBytes idx buf = ReadWord idx buf
 
@@ -341,7 +341,7 @@ copySlice s@(Lit srcOffset) d@(Lit dstOffset) sz@(Lit size) src ds@(ConcreteBuf 
     sl = [readByte (Lit i) src | i <- [srcOffset .. srcOffset + (size - 1)]]
     tl = BS.drop (num dstOffset + num size) dst
     in if Prelude.and . (fmap isLitByte) $ sl
-       then ConcreteBuf $ hd <> (BS.pack . (mapMaybe unlitByte) $ sl) <> tl
+       then ConcreteBuf $ hd <> (BS.pack . (mapMaybe maybeLitByte) $ sl) <> tl
        else CopySlice s d sz src ds
   | otherwise = CopySlice s d sz src ds
 
@@ -466,14 +466,10 @@ minLength bufEnv = go 0
       b <- Map.lookup a bufEnv
       go l b
 
-word256At
-  :: Functor f
-  => Expr EWord -> (Expr EWord -> f (Expr EWord))
-  -> Expr Buf -> f (Expr Buf)
+word256At :: Expr EWord -> Lens (Expr Buf) (Expr Buf) (Expr EWord) (Expr EWord)
 word256At i = lens getter setter where
   getter = readWord i
   setter m x = writeWord i x m
-
 
 -- | Returns the first n bytes of buf
 take :: W256 -> Expr Buf -> Expr Buf
@@ -499,7 +495,7 @@ toList buf = case bufLength buf of
 
 fromList :: V.Vector (Expr Byte) -> Expr Buf
 fromList bs = case Prelude.and (fmap isLitByte bs) of
-  True -> ConcreteBuf . BS.pack . V.toList . V.mapMaybe unlitByte $ bs
+  True -> ConcreteBuf . BS.pack . V.toList . V.mapMaybe maybeLitByte $ bs
   -- we want to minimize the size of the resulting expresion, so we do two passes:
   --   1. write all concrete bytes to some base buffer
   --   2. write all symbolic writes on top of this buffer
@@ -792,8 +788,22 @@ simplify e = if (mapExpr go e == e)
     -- Double NOT is a no-op, since it's a bitwise inversion
     go (EVM.Types.Not (EVM.Types.Not a)) = a
 
+    -- Some trivial min / max eliminations
     go (Max (Lit 0) a) = a
     go (Min (Lit 0) _) = Lit 0
+
+    -- If a >= b then the value of the `Max` expression can never be < b
+    go o@(LT (Max (Lit a) _) (Lit b))
+      | a >= b = Lit 0
+      | otherwise = o
+    go o@(SLT (Sub (Max (Lit a) _) (Lit b)) (Lit c))
+      = let sa, sb, sc :: Int256
+            sa = fromIntegral a
+            sb = fromIntegral b
+            sc = fromIntegral c
+        in if sa >= sb && sa - sb >= sc
+           then Lit 0
+           else o
 
     go a = a
 
@@ -945,7 +955,7 @@ padBytesLeft n bs
 
 joinBytes :: [Expr Byte] -> Expr EWord
 joinBytes bs
-  | Prelude.and . (fmap isLitByte) $ bs = Lit . bytesToW256 . (mapMaybe unlitByte) $ bs
+  | Prelude.and . (fmap isLitByte) $ bs = Lit . bytesToW256 . (mapMaybe maybeLitByte) $ bs
   | otherwise = let
       bytes = padBytesLeft 32 bs
     in JoinBytes

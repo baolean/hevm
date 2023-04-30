@@ -6,18 +6,18 @@ module EVM.Fetch where
 import Prelude hiding (Word)
 
 import EVM.ABI
-import EVM.Types    (Addr, W256, hexText, Expr(Lit), Expr(..), Prop(..), (.&&), (./=))
 import EVM.SMT
 import EVM.Solvers
-import EVM          (EVM, Contract, Block, initialContract, nonce, balance, external)
+import EVM.Types
+import EVM.Format (hexText)
+import EVM        (initialContract)
 import qualified EVM.FeeSchedule as FeeSchedule
 
-import qualified EVM
+import Optics.Core
 
-import Control.Lens hiding ((.=))
 import Control.Monad.Trans.Maybe
 import Data.Aeson hiding (Error)
-import Data.Aeson.Lens
+import Data.Aeson.Optics
 import qualified Data.ByteString as BS
 import Data.Text (Text, unpack, pack)
 import Data.Maybe (fromMaybe)
@@ -85,51 +85,61 @@ fetchQuery n f q = do
   x <- case q of
     QueryCode addr -> do
         m <- f (rpc "eth_getCode" [toRPC addr, toRPC n])
-        return $ hexText . view _String <$> m
+        pure $ do
+          t <- preview _String <$> m
+          hexText <$> t
     QueryNonce addr -> do
         m <- f (rpc "eth_getTransactionCount" [toRPC addr, toRPC n])
-        return $ readText . view _String <$> m
+        pure $ do
+          t <- preview _String <$> m
+          readText <$> t
     QueryBlock -> do
       m <- f (rpc "eth_getBlockByNumber" [toRPC n, toRPC False])
       return $ m >>= parseBlock
     QueryBalance addr -> do
         m <- f (rpc "eth_getBalance" [toRPC addr, toRPC n])
-        return $ readText . view _String <$> m
+        pure $ do
+          t <- preview _String <$> m
+          readText <$> t
     QuerySlot addr slot -> do
         m <- f (rpc "eth_getStorageAt" [toRPC addr, toRPC slot, toRPC n])
-        return $ readText . view _String <$> m
+        pure $ do
+          t <- preview _String <$> m
+          readText <$> t
     QueryChainId -> do
         m <- f (rpc "eth_chainId" [toRPC n])
-        return $ readText . view _String <$> m
+        pure $ do
+          t <- preview _String <$> m
+          readText <$> t
   return x
 
 
-parseBlock :: (AsValue s, Show s) => s -> Maybe EVM.Block
+parseBlock :: (AsValue s, Show s) => s -> Maybe Block
 parseBlock j = do
-  coinbase   <- readText <$> j ^? key "miner" . _String
-  timestamp  <- Lit . readText <$> j ^? key "timestamp" . _String
-  number     <- readText <$> j ^? key "number" . _String
-  gasLimit   <- readText <$> j ^? key "gasLimit" . _String
+  coinbase   <- readText <$> j ^? key "miner" % _String
+  timestamp  <- Lit . readText <$> j ^? key "timestamp" % _String
+  number     <- readText <$> j ^? key "number" % _String
+  gasLimit   <- readText <$> j ^? key "gasLimit" % _String
   let
-   baseFee = readText <$> j ^? key "baseFeePerGas" . _String
+   baseFee = readText <$> j ^? key "baseFeePerGas" % _String
    -- It seems unclear as to whether this field should still be called mixHash or renamed to prevRandao
    -- According to https://github.com/ethereum/EIPs/blob/master/EIPS/eip-4399.md it should be renamed
    -- but alchemy is still returning mixHash
-   mixhash = readText <$> j ^? key "mixHash" . _String
-   prevRandao = readText <$> j ^? key "prevRandao" . _String
-   difficulty = readText <$> j ^? key "difficulty" . _String
+   mixhash = readText <$> j ^? key "mixHash" % _String
+   prevRandao = readText <$> j ^? key "prevRandao" % _String
+   difficulty = readText <$> j ^? key "difficulty" % _String
    prd = case (prevRandao, mixhash, difficulty) of
      (Just p, _, _) -> p
      (Nothing, Just mh, Just 0x0) -> mh
      (Nothing, Just _, Just d) -> d
      _ -> error "Internal Error: block contains both difficulty and prevRandao"
   -- default codesize, default gas limit, default feescedule
-  return $ EVM.Block coinbase timestamp number prd gasLimit (fromMaybe 0 baseFee) 0xffffffff FeeSchedule.berlin
+  return $ Block coinbase timestamp number prd gasLimit (fromMaybe 0 baseFee) 0xffffffff FeeSchedule.berlin
 
 fetchWithSession :: Text -> Session -> Value -> IO (Maybe Value)
 fetchWithSession url sess x = do
   r <- asValue =<< Session.post sess (unpack url) x
-  return (r ^? responseBody . key "result")
+  return (r ^? (lensVL responseBody) % key "result")
 
 fetchContractWithSession
   :: BlockNumber -> Text -> Addr -> Session -> IO (Maybe Contract)
@@ -143,10 +153,10 @@ fetchContractWithSession n url addr sess = runMaybeT $ do
   theBalance <- MaybeT $ fetch (QueryBalance addr)
 
   return $
-    initialContract (EVM.RuntimeCode (EVM.ConcreteRuntimeCode theCode))
-      & set nonce    theNonce
-      & set balance  theBalance
-      & set external True
+    initialContract (RuntimeCode (ConcreteRuntimeCode theCode))
+      & set #nonce    theNonce
+      & set #balance  theBalance
+      & set #external True
 
 fetchSlotWithSession
   :: BlockNumber -> Text -> Session -> Addr -> W256 -> IO (Maybe W256)
@@ -159,19 +169,24 @@ fetchBlockWithSession n url sess =
   fetchQuery n (fetchWithSession url sess) QueryBlock
 
 fetchBlockFrom :: BlockNumber -> Text -> IO (Maybe Block)
-fetchBlockFrom n url =
-  Session.withAPISession
-    (fetchBlockWithSession n url)
+fetchBlockFrom n url = do
+  sess <- Session.newAPISession
+  fetchBlockWithSession n url sess
 
 fetchContractFrom :: BlockNumber -> Text -> Addr -> IO (Maybe Contract)
-fetchContractFrom n url addr =
-  Session.withAPISession
-    (fetchContractWithSession n url addr)
+fetchContractFrom n url addr = do
+  sess <- Session.newAPISession
+  fetchContractWithSession n url addr sess
 
 fetchSlotFrom :: BlockNumber -> Text -> Addr -> W256 -> IO (Maybe W256)
-fetchSlotFrom n url addr slot =
-  Session.withAPISession
-    (\s -> fetchSlotWithSession n url s addr slot)
+fetchSlotFrom n url addr slot = do
+  sess <- Session.newAPISession
+  fetchSlotWithSession n url sess addr slot
+
+fetchChainIdFrom :: Text -> IO (Maybe W256)
+fetchChainIdFrom url = do
+  sess <- Session.newAPISession
+  fetchQuery Latest (fetchWithSession url sess) QueryChainId
 
 http :: Natural -> Maybe Natural -> BlockNumber -> Text -> Fetcher
 http smtjobs smttimeout n url q =
@@ -187,46 +202,29 @@ zero smtjobs smttimeout q =
 oracle :: SolverGroup -> RpcInfo -> Fetcher
 oracle solvers info q = do
   case q of
-    EVM.PleaseDoFFI vals continue -> case vals of
+    PleaseDoFFI vals continue -> case vals of
        cmd : args -> do
           (_, stdout', _) <- readProcessWithExitCode cmd args ""
           pure . continue . encodeAbiValue $
             AbiTuple (RegularVector.fromList [ AbiBytesDynamic . hexText . pack $ stdout'])
        _ -> error (show vals)
 
-    EVM.PleaseAskSMT branchcondition pathconditions continue -> do
+    PleaseAskSMT branchcondition pathconditions continue -> do
          let pathconds = foldl' PAnd (PBool True) pathconditions
          -- Is is possible to satisfy the condition?
          continue <$> checkBranch solvers (branchcondition ./= (Lit 0)) pathconds
 
     -- if we are using a symbolic storage model,
     -- we generate a new array to the fetched contract here
-    EVM.PleaseFetchContract addr continue -> do
+    PleaseFetchContract addr continue -> do
       contract <- case info of
-                    Nothing -> return $ Just $ initialContract (EVM.RuntimeCode (EVM.ConcreteRuntimeCode ""))
+                    Nothing -> return $ Just $ initialContract (RuntimeCode (ConcreteRuntimeCode ""))
                     Just (n, url) -> fetchContractFrom n url addr
       case contract of
         Just x -> return $ continue x
         Nothing -> error ("oracle error: " ++ show q)
 
-    --EVM.PleaseMakeUnique val pathconditions continue ->
-          --case smtstate of
-            --Nothing -> return $ continue Multiple
-            --Just state -> flip runReaderT state $ SBV.runQueryT $ do
-              --constrain $ sAnd $ pathconditions <> [val .== val] -- dummy proposition just to make sure `val` is defined when we do `getValue` later.
-              --checkSat >>= \case
-                --Sat -> do
-                  --val' <- getValue val
-                  --s    <- checksat (val ./= literal val')
-                  --case s of
-                    --Unsat -> pure $ continue $ Unique val'
-                    --_ -> pure $ continue Multiple
-                --Unsat -> pure $ continue InconsistentU
-                --Unk -> pure $ continue TimeoutU
-                --DSat _ -> error "unexpected DSAT"
-
-
-    EVM.PleaseFetchSlot addr slot continue ->
+    PleaseFetchSlot addr slot continue ->
       case info of
         Nothing -> return (continue 0)
         Just (n, url) ->
@@ -235,29 +233,29 @@ oracle solvers info q = do
            Nothing ->
              error ("oracle error: " ++ show q)
 
-type Fetcher = EVM.Query -> IO (EVM ())
+type Fetcher = Query -> IO (EVM ())
 
 -- | Checks which branches are satisfiable, checking the pathconditions for consistency
 -- if the third argument is true.
 -- When in debug mode, we do not want to be able to navigate to dead paths,
 -- but for normal execution paths with inconsistent pathconditions
 -- will be pruned anyway.
-checkBranch :: SolverGroup -> Prop -> Prop -> IO EVM.BranchCondition
+checkBranch :: SolverGroup -> Prop -> Prop -> IO BranchCondition
 checkBranch solvers branchcondition pathconditions = do
   checkSat solvers (assertProps [(branchcondition .&& pathconditions)]) >>= \case
      -- the condition is unsatisfiable
      Unsat -> -- if pathconditions are consistent then the condition must be false
-            return $ EVM.Case False
+            return $ Case False
      -- Sat means its possible for condition to hold
      Sat _ -> -- is its negation also possible?
             checkSat solvers (assertProps [(pathconditions .&& (PNeg branchcondition))]) >>= \case
                -- No. The condition must hold
-               Unsat -> return $ EVM.Case True
+               Unsat -> return $ Case True
                -- Yes. Both branches possible
-               Sat _ -> return EVM.Unknown
+               Sat _ -> return EVM.Types.Unknown
                -- Explore both branches in case of timeout
-               Unknown -> return EVM.Unknown
+               EVM.Solvers.Unknown -> return EVM.Types.Unknown
                Error e -> error $ "Internal Error: SMT Solver returned with an error: " <> T.unpack e
      -- If the query times out, we simply explore both paths
-     Unknown -> return EVM.Unknown
+     EVM.Solvers.Unknown -> return EVM.Types.Unknown
      Error e -> error $ "Internal Error: SMT Solver returned with an error: " <> T.unpack e
